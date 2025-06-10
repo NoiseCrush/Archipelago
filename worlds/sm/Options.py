@@ -198,7 +198,6 @@ class NerfedCharge(Toggle):
     display_name = "Nerfed Charge"
 
 class GravityBehaviour(Choice):
-    """Modify the heat damage and enemy damage reduction qualities of the Gravity and Varia Suits."""
     display_name = "Gravity Behaviour"
     option_Vanilla = 0
     option_Balanced = 1
