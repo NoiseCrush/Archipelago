@@ -198,6 +198,12 @@ class NerfedCharge(Toggle):
     display_name = "Nerfed Charge"
 
 class GravityBehaviour(Choice):
+    """Modify the heat damage and enemy damage reduction qualities of the Gravity and Varia Suits.
+    - Vanilla: Gravity provides full protection against all environmental damage (heat, spikes, etc.)
+    - Balanced: Removes Gravity environmental protection. Doubles Varia environmental protection. Enemy damage protection
+    is vanilla (50% Varia, 75% Gravity).
+    - Progressive: Gravity provides 50% heat reduction, Varia provides full heat reduction. Each suit adds 50% enemy
+    and environmental reduction, stacking to 75% reduction if you have both."""
     display_name = "Gravity Behaviour"
     option_Vanilla = 0
     option_Balanced = 1
