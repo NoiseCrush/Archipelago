@@ -1,5 +1,5 @@
 import typing
-from Options import Choice, PerGameCommonOptions, Range, OptionDict, OptionList, OptionSet, Option, Toggle, DefaultOnToggle
+from Options import Choice, PerGameCommonOptions, Range, OptionDict, OptionList, OptionSet, OptionGroup, Toggle, DefaultOnToggle
 from .variaRandomizer.utils.objectives import _goals
 from dataclasses import dataclass
 
@@ -83,7 +83,7 @@ class MaxDifficulty(Choice):
     default = 4
 
 class MorphPlacement(Choice):
-    """Influences where the Morphing Ball with be placed."""
+    """Influences where the Morphing Ball will be placed."""
     display_name = "Morph Placement"
     option_early = 0
     option_normal = 1
@@ -396,6 +396,66 @@ class RelaxedRoundRobinCF(Toggle):
     The Crystal Flash ends when Samus is out of ammo or a total of 30 ammo has been consumed.
     """
     display_name = "Relaxed round robin Crystal Flash"
+
+sm_option_groups = [
+    OptionGroup("Logic", [
+        Preset,
+        MaxDifficulty,
+        StartLocation,
+        VariaCustomPreset,
+        CustomPreset,
+    ]),
+    OptionGroup("Objectives and Endgame", [
+        Objective,
+        CustomObjective,
+        CustomObjectiveCount,
+        CustomObjectiveList,
+        Tourian,
+        EscapeRando,
+        RemoveEscapeEnemies,
+        Animals,
+    ]),
+    OptionGroup("Areas and Layout", [
+        AreaRandomization,
+        AreaLayout,
+        DoorsColorsRando,
+        AllowGreyDoors,
+        BossRandomization,
+        LayoutPatches,
+    ]),
+    OptionGroup("Item Pool", [
+        MorphPlacement,
+        StrictMinors,
+        MissileQty,
+        SuperQty,
+        PowerBombQty,
+        MinorQty,
+        EnergyQty,
+        FunCombat,
+        FunMovement,
+        FunSuits,
+    ]),
+    OptionGroup("Misc Tweaks", [
+        VariaTweaks,
+        GravityBehaviour,
+        NerfedCharge,
+        SpinJumpRestart,
+        SpeedKeep,
+        InfiniteSpaceJump,
+        RelaxedRoundRobinCF,
+    ]),
+    OptionGroup("Quality of Life", [
+        ElevatorsSpeed,
+        DoorsSpeed,
+        RefillBeforeSave,
+    ]),
+    OptionGroup("Cosmetic", [
+        Hud,
+        HideItems,
+        NoMusic,
+        RandomMusic,
+    ]),
+]
 
 @dataclass
 class SMOptions(PerGameCommonOptions):
