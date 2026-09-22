@@ -21,6 +21,8 @@ import time
 import typing
 import weakref
 import zlib
+from signal import SIGINT, SIGTERM, signal
+from typing import Sequence
 
 import ModuleUpdate
 
@@ -58,6 +60,67 @@ server_per_message_deflate_factory = ServerPerMessageDeflateFactory(
     client_max_window_bits=11,
     compress_settings={"memLevel": 4},
 )
+
+class BounceTarget(typing.NamedTuple):
+    teams: set[int] | None
+    games: set[str] | None
+    tags: set[str] | None
+    slots: set[int] | None
+
+    def _teams_match(self, target: Client) -> bool:
+        return target.team in self.teams
+
+    def _games_match(self, target: Client) -> bool:
+        return target.ctx().games[target.slot] in self.games
+
+    def _tags_match(self, target: Client) -> bool:
+        return bool(set(target.tags) & self.tags)
+
+    def _slots_match(self, target: Client) -> bool:
+        return target.slot in self.slots
+
+    def _get_conditions(self, include_teams: bool = True) -> Sequence[typing.Callable[[Client], bool]]:
+        conditions = []
+        if self.teams is not None and include_teams:
+            conditions.append(self._teams_match)
+        if self.games is not None:
+            conditions.append(self._games_match)
+        if self.tags is not None:
+            conditions.append(self._tags_match)
+        if self.slots is not None:
+            conditions.append(self._slots_match)
+
+        return conditions
+
+    def match_clients_legacy(self, clients: typing.Iterable[Client]) -> typing.Generator[Client, None, None]:
+        non_team_conditions = self._get_conditions(include_teams=False)
+
+        # Do as little work as possible: Pre-check teams is None
+        if self.teams is None:
+            for bounce_client in clients:
+                if any(condition(bounce_client) for condition in non_team_conditions):
+                    yield bounce_client
+        else:
+            for bounce_client in clients:
+                if self._teams_match(bounce_client) and any(
+                    condition(bounce_client) for condition in non_team_conditions
+                ):
+                    yield bounce_client
+
+    def match_clients_or(self, clients: typing.Iterable[Client]) -> typing.Generator[Client, None, None]:
+        conditions = self._get_conditions(include_teams=True)
+
+        for bounce_client in clients:
+            if any(condition(bounce_client) for condition in conditions):
+                yield bounce_client
+
+    def match_clients_and(self, clients: typing.Iterable[Client]) -> typing.Generator[Client, None, None]:
+        conditions = self._get_conditions(include_teams=True)
+
+        for bounce_client in clients:
+            if all(condition(bounce_client) for condition in conditions):
+                yield bounce_client
+
 
 
 def remove_from_list(container, value):
@@ -496,7 +559,8 @@ class Context:
 
         self.read_data = {}
         # there might be a better place to put this.
-        self.read_data["race_mode"] = lambda: decoded_obj.get("race_mode", 0)
+        race_mode = decoded_obj.get("race_mode", 0)
+        self.read_data["race_mode"] = lambda: race_mode
         mdata_ver = decoded_obj["minimum_versions"]["server"]
         if mdata_ver > version_tuple:
             raise RuntimeError(f"Supplied Multidata (.archipelago) requires a server of at least version {mdata_ver}, "
@@ -917,12 +981,6 @@ async def server(websocket: "ServerConnection", path: str = "/", ctx: Context = 
 
 
 async def on_client_connected(ctx: Context, client: Client):
-    players = []
-    for team, clients in ctx.clients.items():
-        for slot, connected_clients in clients.items():
-            if connected_clients:
-                name = ctx.player_names[team, slot]
-                players.append(NetworkPlayer(team, slot, ctx.name_aliases.get((team, slot), name), name))
     games = {ctx.games[x] for x in range(1, len(ctx.games) + 1)}
     games.add("Archipelago")
     await ctx.send_msgs(client, [{
@@ -1307,6 +1365,13 @@ class CommandMeta(type):
             commands.update(base.commands)
         commands.update({command_name[5:]: method for command_name, method in attrs.items() if
                          command_name.startswith("_cmd_")})
+        for command_name, method in commands.items():
+            # wrap async def functions so they run on default asyncio loop
+            if inspect.iscoroutinefunction(method):
+                def _wrapper(self, *args, _method=method, **kwargs):
+                    return async_start(_method(self, *args, **kwargs))
+                functools.update_wrapper(_wrapper, method)
+                commands[command_name] = _wrapper
         return super(CommandMeta, cls).__new__(cls, name, bases, attrs)
 
 
@@ -1370,7 +1435,10 @@ class CommandProcessor(metaclass=CommandMeta):
                         argname += "=" + parameter.default
                 argtext += argname
                 argtext += " "
-            doctext = '\n    '.join(inspect.getdoc(method).split('\n'))
+            method_doc = inspect.getdoc(method)
+            if method_doc is None:
+                method_doc = "(missing help text)"
+            doctext = "\n    ".join(method_doc.split("\n"))
             s += f"{self.marker}{command} {argtext}\n    {doctext}\n"
         return s
 
@@ -2141,17 +2209,56 @@ async def process_client_cmd(ctx: Context, client: Client, args: dict):
             client.messageprocessor(args["text"])
 
         elif cmd == "Bounce":
-            games = set(args.get("games", []))
-            tags = set(args.get("tags", []))
-            slots = set(args.get("slots", []))
+            for name, expected_type in (
+                ("teams", int), ("games", str), ("tags", str), ("slots", int)
+            ):
+                if name not in args:
+                    continue
+
+                value = args[name]
+
+                if (
+                    value is None
+                    or not isinstance(value, (list, set))
+                    or not all(isinstance(entry, expected_type) for entry in value)
+                ):
+                    await ctx.send_msgs(client, [{
+                        "cmd": "InvalidPacket", "type": "arguments",
+                        "text": f'Bounce: "{name}" list provided did not have the correct format.',
+                        "original_cmd": cmd}])
+                    return
+
+            # We now know that if a key is present, it is not None, so this should be the best way to get "set or None"
+            teams = set(args["teams"]) if "teams" in args else {client.team}  # Team default is only same team
+            games = set(args["games"]) if "games" in args else None
+            tags = set(args["tags"]) if "tags" in args else None
+            slots = set(args["slots"]) if "slots" in args else None
+
+            bounce_target = BounceTarget(teams, games, tags, slots)
+
             args["cmd"] = "Bounced"
             msg = ctx.dumper([args])
 
-            for bounceclient in ctx.endpoints:
-                if client.team == bounceclient.team and (ctx.games[bounceclient.slot] in games or
-                                                         set(bounceclient.tags) & tags or
-                                                         bounceclient.slot in slots):
-                    await ctx.send_encoded_msgs(bounceclient, msg)
+            boolean_operator = args.get("operator", "legacy")
+
+            if boolean_operator == "legacy":
+                match_function = bounce_target.match_clients_legacy
+            elif boolean_operator == "or":
+                match_function = bounce_target.match_clients_or
+            elif boolean_operator == "and":
+                match_function = bounce_target.match_clients_and
+            else:
+                await ctx.send_msgs(client, [{
+                    'cmd': 'InvalidPacket', "type": "arguments",
+                    'text': f'Bounce: Unknown operator. Supported: legacy, or, and. Found: {operator}',
+                    'original_cmd': cmd
+                }])
+                return
+
+            for matching_client in match_function(ctx.endpoints):
+                await ctx.send_encoded_msgs(matching_client, msg)
+
+            return
 
         elif cmd == "Get":
             if "keys" not in args or type(args["keys"]) != list:
@@ -2535,7 +2642,14 @@ class ServerCommandProcessor(CommonCommandProcessor):
         if option_name in {"release_mode", "remaining_mode", "collect_mode"}:
             self.ctx.broadcast_all([{"cmd": "RoomUpdate", 'permissions': get_permissions(self.ctx)}])
         elif option_name in {"hint_cost", "location_check_points"}:
-            self.ctx.broadcast_all([{"cmd": "RoomUpdate", option_name: getattr(self.ctx, option_name)}])
+            # Update hint point amounts per slot
+            for team, players in self.ctx.clients.items():
+                for slot, clients in players.items():
+                    self.ctx.broadcast(clients, [{
+                        "cmd": "RoomUpdate",
+                        option_name: getattr(self.ctx, option_name),
+                        "hint_points": get_slot_points(self.ctx, team, slot),
+                    }])
         return True
 
     def _cmd_datastore(self):
@@ -2566,6 +2680,8 @@ async def console(ctx: Context):
             input_text = await queue.get()
             queue.task_done()
             ctx.commandprocessor(input_text)
+        except asyncio.exceptions.CancelledError:
+            ctx.logger.info("ConsoleTask cancelled")
         except:
             import traceback
             traceback.print_exc()
@@ -2625,8 +2741,8 @@ def parse_args() -> argparse.Namespace:
                              goal:     !remaining can be used after goal completion
                              ''')
     parser.add_argument('--auto_shutdown', default=defaults["auto_shutdown"], type=int,
-                        help="automatically shut down the server after this many minutes without new location checks. "
-                             "0 to keep running. Not yet implemented.")
+                        help="automatically shut down the server after this many seconds without new location checks. "
+                             "0 to keep running.")
     parser.add_argument('--use_embedded_options', action="store_true",
                         help='retrieve release, remaining and hint options from the multidata file,'
                              ' instead of host.yaml')
@@ -2732,6 +2848,26 @@ async def main(args: argparse.Namespace):
     console_task = asyncio.create_task(console(ctx))
     if ctx.auto_shutdown:
         ctx.shutdown_task = asyncio.create_task(auto_shutdown(ctx, [console_task]))
+
+    def stop():
+        try:
+            for remove_signal in [SIGINT, SIGTERM]:
+                asyncio.get_event_loop().remove_signal_handler(remove_signal)
+        except NotImplementedError:
+            pass
+        ctx.commandprocessor._cmd_exit()
+
+    def shutdown(signum, frame):
+        stop()
+
+    try:
+        for sig in [SIGINT, SIGTERM]:
+            asyncio.get_event_loop().add_signal_handler(sig, stop)
+    except NotImplementedError:
+        # add_signal_handler is only implemented for UNIX platforms
+        for sig in [SIGINT, SIGTERM]:
+            signal(sig, shutdown)
+
     await ctx.exit_event.wait()
     console_task.cancel()
     if ctx.shutdown_task:
